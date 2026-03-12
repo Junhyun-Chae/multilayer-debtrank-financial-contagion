@@ -1,10 +1,6 @@
-"""
-Author: Junhyun Chae
-University of Hyogo
-Research: Multilayer Financial Risk Propagation
-
-This code was developed for the research on international systemic risk using DebtRank.
-"""
+Author: Junhyun Chae  
+University of Hyogo  
+Research: Multilayer DebtRank Financial Risk Propagation
 
 # Multilayer DebtRank Systemic Risk Analysis
 
