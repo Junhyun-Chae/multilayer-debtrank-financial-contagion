@@ -1,0 +1,935 @@
+
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from mpl_toolkits.basemap import Basemap  
+import matplotlib.animation as animation  
+
+plt.rcParams.update({
+    "font.size": 18,
+    "legend.fontsize": 18,
+})
+
+
+COUNTRY_META_BIS = {
+    "codes": [
+        "AT", "AU", "BE", "BR", "CA", "CH", "CL", "DE", "DK", "ES",
+        "FI", "FR", "GB", "HK", "IE", "IT", "NL", "SE", "US", "JP",
+    ],
+    "name_map": {
+        "AT": "Austria", "AU": "Australia", "BE": "Belgium", "BR": "Brazil",
+        "CA": "Canada", "CH": "Switzerland", "CL": "Chile", "DE": "Germany",
+        "DK": "Denmark", "ES": "Spain", "FI": "Finland", "FR": "France",
+        "GB": "United Kingdom", "HK": "Hong Kong", "IE": "Ireland",
+        "IT": "Italy", "NL": "Netherlands", "SE": "Sweden",
+        "US": "United States", "JP": "Japan",
+    },
+}
+
+COUNTRY_META_UN = {
+    "codes": [
+        "AUT", "AUS", "BEL", "BRA", "CAN", "CHE", "CHL", "DEU", "DNK", "ESP",
+        "FIN", "FRA", "GBR", "HKG", "IRL", "ITA", "NLD", "SWE", "USA", "JPN",
+    ],
+    "name_map": {
+        "AUT": "Austria", "AUS": "Australia", "BEL": "Belgium", "BRA": "Brazil",
+        "CAN": "Canada", "CHE": "Switzerland", "CHL": "Chile", "DEU": "Germany",
+        "DNK": "Denmark", "ESP": "Spain", "FIN": "Finland", "FRA": "France",
+        "GBR": "United Kingdom", "HKG": "Hong Kong", "IRL": "Ireland",
+        "ITA": "Italy", "NLD": "Netherlands", "SWE": "Sweden",
+        "USA": "United States", "JPN": "Japan",
+    },
+}
+
+
+COORDS_GENERIC = {
+    "Austria": (14.5501, 47.5162),
+    "Australia": (133.7751, -25.2744),
+    "Belgium": (4.4699, 50.5039),
+    "Brazil": (-51.9253, -14.2350),
+    "Canada": (-106.3468, 56.1304),
+    "Switzerland": (8.2275, 46.8182),
+    "Chile": (-71.5429, -35.6751),
+    "Germany": (10.4515, 51.1657),
+    "Denmark": (9.5018, 56.2639),
+    "Spain": (-3.7038, 40.4637),
+    "Finland": (25.7482, 61.9241),
+    "France": (2.2137, 46.6034),
+    "United Kingdom": (-3.4360, 55.3781),
+    "Hong Kong": (114.1694, 22.3193),
+    "Ireland": (-8.2439, 53.4129),
+    "Italy": (12.5674, 41.8719),
+    "Netherlands": (5.2913, 52.1326),
+    "Sweden": (18.6435, 60.1282),
+    "United States": (-95.7129, 37.0902),
+    "Japan": (138.2529, 36.2048),
+}
+
+def propagate_multiplex(
+    W_layers: list[np.ndarray],
+    h0: np.ndarray,            
+    buffer: float | np.ndarray = 0.0,  
+    c: float | None = None,          
+    max_iter: int = 100,
+    eps: float = 1e-4,
+):
+    L, N = h0.shape
+    if np.isscalar(buffer):
+        buffer = np.full((L, N), float(buffer))
+    if c is None:
+        c = 1.0 / L
+
+    h_prev = np.zeros_like(h0)
+    h      = h0.copy()
+    H      = h0.copy()        
+    history: list[np.ndarray] = [H.copy()]
+
+    for _ in range(max_iter):
+        Δh = np.maximum(0, h - h_prev)      
+        new_h = np.zeros_like(h)
+        for ℓ, W in enumerate(W_layers):
+            new_h[ℓ] = (W @ Δh[ℓ]).clip(0, 1)
+
+        new_h = np.maximum(0, new_h - buffer) 
+        vertical = new_h.sum(axis=0) > c       
+        new_h[:, vertical] = 1.0              
+        H = np.minimum(H + new_h, 1.0)
+        history.append(H.copy())
+
+        if np.all(new_h < eps):
+            break
+        h_prev, h = h, new_h
+    return history         
+
+
+
+
+def _ensure_outdir(out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _normalise_weight_matrix(wm: np.ndarray) -> np.ndarray:
+    max_val = wm.max()
+    return wm if max_val == 0 else wm / max_val
+
+
+
+def load_dataset_bis(base_dir: Path) -> tuple[
+    dict[str, np.ndarray], list[str], dict[str, str], dict[str, tuple[float, float]], list[str]
+]:
+    all_countries_file = base_dir / "BIS_debtrank" / "all_countries_fx_c.xlsx"
+    one_country_file = base_dir / "BIS_debtrank" / "one_countries_fx_c.xlsx"
+
+    all_df = pd.read_excel(all_countries_file, sheet_name="Aggregated Data")
+    one_df = pd.read_excel(one_country_file, sheet_name="Aggregated Data")
+
+    all_df.columns = all_df.columns.str.strip()
+    one_df.columns = one_df.columns.str.strip()
+
+    all_df["L_REP_CTYReporting country"] = all_df["L_REP_CTYReporting country"].str.split(":").str[0].str.strip()
+    all_df["L_CP_COUNTRYCounterparty country"] = all_df["L_CP_COUNTRYCounterparty country"].str.split(":").str[0].str.strip()
+    one_df["L_REP_CTYReporting country"] = one_df["L_REP_CTYReporting country"].str.split(":").str[0].str.strip()
+    one_df["L_CP_COUNTRYCounterparty country"] = one_df["L_CP_COUNTRYCounterparty country"].str.split(":").str[0].str.strip()
+
+    countries = COUNTRY_META_BIS["codes"]
+
+    all_c = (
+        all_df.groupby(["L_REP_CTYReporting country", "TIME_PERIODTime period or range"])[
+            "OBS_VALUEObservation Value"
+        ].first().reset_index().rename(columns={"OBS_VALUEObservation Value": "TotalGiven"})
+    )
+
+    one_df = one_df[one_df["L_REP_CTYReporting country"].isin(all_c["L_REP_CTYReporting country"]) ]
+
+    one_c = (
+        one_df.groupby([
+            "L_REP_CTYReporting country", "L_CP_COUNTRYCounterparty country", "TIME_PERIODTime period or range"
+        ])["OBS_VALUEObservation Value"].first().reset_index().rename(columns={"OBS_VALUEObservation Value": "GivenToCp"})
+    )
+
+    merged = pd.merge(
+        one_c,
+        all_c,
+        on=["L_REP_CTYReporting country", "TIME_PERIODTime period or range"],
+        how="left",
+    )
+    merged["Leverage"] = merged.apply(
+        lambda r: 0 if r.TotalGiven == 0 else r.GivenToCp / r.TotalGiven,
+        axis=1,
+    )
+
+    merged = merged[(merged["TIME_PERIODTime period or range"] >= "2000-Q1") & (merged["TIME_PERIODTime period or range"] <= "2023-Q4")]
+
+    periods = sorted(merged["TIME_PERIODTime period or range"].unique())
+
+    weight_matrices: dict[str, np.ndarray] = {}
+    for p in periods:
+        data_p = merged[merged["TIME_PERIODTime period or range"] == p]
+        wm = np.zeros((len(countries), len(countries)))
+        for _, row in data_p.iterrows():
+            if (row["L_REP_CTYReporting country"] in countries and
+                    row["L_CP_COUNTRYCounterparty country"] in countries):
+                i = countries.index(row["L_REP_CTYReporting country"])
+                j = countries.index(row["L_CP_COUNTRYCounterparty country"])
+                wm[j, i] = max(0, row.Leverage)
+        weight_matrices[p] = wm
+
+    return (
+        weight_matrices,
+        countries,
+        COUNTRY_META_BIS["name_map"],
+        {code: COORDS_GENERIC[COUNTRY_META_BIS["name_map"][code]] for code in countries},
+        periods,
+    )
+
+
+def load_dataset_un(base_dir: Path) -> tuple[
+    dict[str, np.ndarray], list[str], dict[str, str], dict[str, tuple[float, float]], list[pd.Timestamp]
+]:
+    """Load UN dataset and build leverage matrices."""
+    all_c_file = base_dir / "UN_debtrank" / "all_countries_e.xlsx"
+    one_c_file = base_dir / "UN_debtrank" / "one_countries_e_c.csv"
+
+
+    all_df = pd.read_excel(all_c_file, sheet_name="Aggregated Data")
+    one_df = pd.read_csv(one_c_file)
+
+    all_df.columns = all_df.columns.str.strip()
+    one_df.columns = one_df.columns.str.strip()
+
+    all_df["reporterISO"] = all_df["reporterISO"].str.strip()
+    all_df["partnerISO"] = all_df["partnerISO"].str.strip()
+    one_df["reporterISO"] = one_df["reporterISO"].str.strip()
+    one_df["partnerISO"] = one_df["partnerISO"].str.strip()
+
+    all_df["period_quarter"] = pd.to_datetime(all_df["period"].astype(str), format="%Y%m").dt.to_period("Q").dt.start_time
+    one_df["period_quarter"] = pd.to_datetime(one_df["period"].astype(str), format="%Y%m").dt.to_period("Q").dt.start_time
+
+    countries = COUNTRY_META_UN["codes"]
+
+    all_c = (
+        all_df.groupby(["reporterISO", "period_quarter"])["primaryValue"].sum().reset_index().rename(columns={"primaryValue": "TotalGiven"})
+    )
+    one_df = one_df[one_df["reporterISO"].isin(all_c["reporterISO"].unique())]
+
+    one_c = (
+        one_df.groupby(["reporterISO", "partnerISO", "period_quarter"])["primaryValue"].sum().reset_index().rename(columns={"primaryValue": "GivenToCp"})
+    )
+
+    merged = pd.merge(one_c, all_c, on=["reporterISO", "period_quarter"], how="left")
+    merged["Leverage"] = merged.apply(lambda r: 0 if r.TotalGiven == 0 else r.GivenToCp / r.TotalGiven, axis=1)
+
+    periods = sorted(merged["period_quarter"].unique())
+
+    weight_matrices: dict[pd.Timestamp, np.ndarray] = {}
+    for p in periods:
+        data_p = merged[merged["period_quarter"] == p]
+        wm = np.zeros((len(countries), len(countries)))
+        for _, row in data_p.iterrows():
+            if row.reporterISO in countries and row.partnerISO in countries:
+                i = countries.index(row.reporterISO)
+                j = countries.index(row.partnerISO)
+                wm[j, i] = row.Leverage
+        weight_matrices[p] = wm
+
+    return (
+        weight_matrices,
+        countries,
+        COUNTRY_META_UN["name_map"],
+        {code: COORDS_GENERIC[COUNTRY_META_UN["name_map"][code]] for code in countries},
+        periods,
+    )
+
+
+def initialise_risk_tensor(
+    countries: list[str],
+    country_name_map: dict[str, str],
+    default_prob_df: pd.DataFrame,
+    period,
+    L: int,
+):
+
+    vec = initialise_risk_vector(countries, country_name_map, default_prob_df, period)
+    return np.tile(vec, (L, 1))    # (L × N)
+
+
+
+
+def initialise_risk_vector(
+    countries: list[str],
+    country_name_map: dict[str, str],
+    default_prob_df: pd.DataFrame,
+    period,
+):
+    vec = np.zeros(len(countries))
+    period_data = default_prob_df[default_prob_df["Year_Quarter"] == period]
+    for idx, iso in enumerate(countries):
+        cname = country_name_map[iso]
+        prob_arr = period_data.loc[period_data["Country"] == cname, "Default_Probability"].values
+        if prob_arr.size:
+            vec[idx] = max(0.0, prob_arr[0])
+    return vec
+
+
+def propagate_debtrank(
+    weight_matrix: np.ndarray,
+    h0: np.ndarray,
+    max_iter: int = 100,
+    threshold: float = 1e-3,
+):
+    h_prev = np.zeros_like(h0)
+    h = h0.copy()
+    H = h0.copy()
+    history: list[np.ndarray] = []
+
+    for _ in range(max_iter):
+        delta = np.maximum(0, h - h_prev)
+        new_h = (weight_matrix @ delta).clip(0, 1)
+        H = np.minimum(H + new_h, 1)
+        history.append(H.copy())
+        if np.all(new_h < threshold):
+            break
+        h_prev = h
+        h = new_h
+    return history
+
+
+def run_simulation(
+    dataset: str,
+    base_dir: Path,
+    default_file: Path,
+    out_dir: Path,
+    make_animation: bool = True,
+):
+    if dataset.upper() == "BIS":
+        wm, countries, name_map, coords, periods = load_dataset_bis(base_dir)
+    elif dataset.upper() == "UN":
+        wm, countries, name_map, coords, periods = load_dataset_un(base_dir)
+    else:
+        raise ValueError("dataset must be BIS or UN")
+
+    default_df = pd.read_excel(default_file)
+    if dataset.upper() == "UN":
+        default_df["Year_Quarter"] = pd.PeriodIndex(default_df["Year_Quarter"], freq="Q").to_timestamp()
+
+
+
+    weight_tensors = {p: [wm[p], wm[p]] for p in periods}  
+
+    results: dict = {}
+    L = len(weight_tensors[periods[0]])       
+    for per in periods:
+        h0 = initialise_risk_tensor(countries, name_map, default_df, per, L)
+        hist = propagate_multiplex(
+            W_layers = weight_tensors[per],  
+            h0       = h0,                  
+            buffer   = 0.0,                 
+            c        = 1.0 / L,             
+        )
+        results[per] = hist
+
+
+        
+
+    excel_out = out_dir / f"{dataset}_multiplex_results.xlsx"
+    with pd.ExcelWriter(excel_out) as writer:
+        for per, hist in results.items():
+            arr = np.stack(hist)           
+            T, L, N = arr.shape
+            for ℓ in range(L):
+                df = pd.DataFrame(arr[:, ℓ, :], columns=countries)
+                df.index.name = "Step"
+
+                quarter = (per.month - 1)//3 + 1
+                sheet = f"{per.year}-Q{quarter}_L{ℓ}"
+                df.to_excel(writer, sheet_name=sheet)
+    print(f"📓 Results saved → {excel_out}")
+
+
+    if make_animation:
+        print("🎞  Generating animation … this can take a while on first run")
+        _make_animation(results, wm, countries, coords, out_dir / f"{dataset}_propagation.mp4")
+
+
+
+
+def _make_animation(
+    all_histories: dict,
+    weight_matrices: dict,
+    countries: list[str],
+    coords: dict[str, tuple[float, float]],
+    outfile: Path,
+):
+    fig, ax = plt.subplots(figsize=(14, 9))
+    m = Basemap(projection="mill", ax=ax)
+
+    period_order = list(all_histories.keys())
+    cum_lengths = np.cumsum([0] + [len(all_histories[p]) for p in period_order])
+    total_frames = cum_lengths[-1]
+
+    def _update(frame):
+        ax.clear()
+        m.drawcoastlines(); m.drawcountries()
+        idx = np.searchsorted(cum_lengths, frame, side="right") - 1
+        period = period_order[idx]
+        local_step = frame - cum_lengths[idx]
+
+        
+        risks = all_histories[period][local_step]   
+        risks_flat = risks.sum(axis=0)             
+        wm = weight_matrices[period]
+
+        max_risk = max(risks_flat.max(), 1e-6)      
+
+        for iso, risk in zip(countries, risks_flat):
+            x, y = m(*coords[iso])
+            ax.plot(x, y, "o", markersize=10,
+                    color=plt.cm.Reds(risk / max_risk), alpha=0.8)
+
+        for i, iso_from in enumerate(countries):
+            for j, iso_to in enumerate(countries):
+                if wm[j, i] > 0:
+                    x1, y1 = m(*coords[iso_from]); x2, y2 = m(*coords[iso_to])
+                    ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                                arrowprops=dict(arrowstyle="-", lw=wm[j, i]*2, alpha=0.3, color="blue"))
+        ax.set_title(f"{period} – step {local_step+1}")
+
+    ani = animation.FuncAnimation(fig, _update, frames=total_frames, interval=800, repeat=False)
+    ani.save(outfile, writer=animation.FFMpegWriter(fps=2))
+    plt.close(fig)
+    print(f"🎞  Animation saved → {outfile}")
+
+
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="DebtRank risk‑propagation simulator (BIS / UN)")
+    p.add_argument("--dataset", choices=["BIS", "UN"], default="BIS", help="Which dataset to run (default: BIS)")
+    p.add_argument("--base-dir", default="./", type=Path, help="Directory containing BIS/ or UN/ sub‑folders")
+    p.add_argument("--out-dir", default="./output", type=Path, help="Directory for results")
+    p.add_argument("--default-file", default="./default/Default_Probabilities_5Years_Bond.xlsx", type=Path, help="Default probability xlsx path")
+    anim_group = p.add_mutually_exclusive_group()
+    anim_group.add_argument("--animate", dest="animate", action="store_true", default=True, help="Generate mp4 animation (default)")
+    anim_group.add_argument("--no-animation", dest="animate", action="store_false", help="Skip animation")
+    return p.parse_args(argv)
+
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    _ensure_outdir(args.out_dir)
+    run_simulation(
+        dataset=args.dataset,
+        base_dir=args.base_dir,
+        default_file=args.default_file,
+        out_dir=args.out_dir,
+        make_animation=args.animate,
+    )
+
+
+if __name__ == "__main__":
+    main([
+        "--dataset", "UN",
+        "--base-dir", "./",  # ← 여기 수정!
+        "--default-file", "./default/Default_Probabilities_5Years_Bond.xlsx",
+        "--no-animation"
+    ])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from pathlib import Path
+
+
+bis_path = Path("./output/BIS_multiplex_results.xlsx")  
+un_path  = Path("./output/UN_multiplex_results.xlsx")
+
+
+
+
+
+ISO2_TO_3 = {
+    "AU":"AUS","AT":"AUT","BE":"BEL","BR":"BRA","CA":"CAN","CH":"CHE","CL":"CHL",
+    "DE":"DEU","DK":"DNK","ES":"ESP","FI":"FIN","FR":"FRA","GB":"GBR","HK":"HKG",
+    "IE":"IRL","IT":"ITA","JP":"JPN","NL":"NLD","SE":"SWE","US":"USA"
+}
+
+
+desired_order = ["GBR","USA","JPN","FRA","DEU","SWE","FIN","CHE","ITA","ESP",
+                 "IRL","NLD","CAN","BEL","BRA","AUT","DNK","HKG","AUS","CHL"]
+
+
+bis_xl = pd.ExcelFile(bis_path)
+un_xl  = pd.ExcelFile(un_path)
+periods = sorted(set(bis_xl.sheet_names) & set(un_xl.sheet_names))
+if not periods:
+    raise RuntimeError("두 파일에 공통 분기 시트가 없습니다.")
+
+
+def to_iso3(col):
+    col = str(col).strip()
+    if len(col) == 2 and col in ISO2_TO_3:
+        return ISO2_TO_3[col]
+    return col
+
+raw_codes = bis_xl.parse(periods[0]).columns[1:]
+countries = [to_iso3(c) for c in raw_codes]
+
+
+pos = {c:i for i,c in enumerate(countries)}
+
+
+idx_order = [pos[c] for c in desired_order if c in pos]
+labels    = [countries[i] for i in idx_order]
+
+
+def agg_lastrow(xl):
+    _sum = np.zeros(len(countries))
+    _cnt = np.zeros(len(countries), int)
+    THR = 1.0
+    for sheet in periods:
+        last = xl.parse(sheet).iloc[-1, 1:].astype(float).values
+        _sum += last
+        _cnt += (last >= THR)
+    return _sum[idx_order], _cnt[idx_order]
+
+bis_sum, bis_cnt = agg_lastrow(bis_xl)
+un_sum , un_cnt  = agg_lastrow(un_xl)
+
+
+def minmax(x):
+    x = np.asarray(x, float)
+    return (x - x.min()) / (x.max() - x.min() + 1e-12)
+
+def bubble(counts, emph=(29,32), base=4000, min_size=80):
+    if counts.max() == 0:
+        return np.full_like(counts, min_size)
+    s = np.log1p(counts.astype(float))
+    s[(counts >= emph[0]) & (counts <= emph[1])] *= 1.8
+    scaled = base * s / s.max()
+    return np.maximum(scaled, min_size) 
+
+
+bis_norm = minmax(bis_sum)
+un_norm  = minmax(un_sum)
+
+bis_bub  = bubble(bis_cnt)
+un_bub   = bubble(un_cnt)
+
+def plot(layer, norm, bub, color, out_png):
+    plt.figure(figsize=(20,12))
+    plt.scatter(labels, norm, s=bub, c=color, alpha=.7)
+    plt.title(f"{layer} Layer – Normalized DebtRank (All Periods, Last Row)",
+              fontsize=40, pad=20)
+    plt.xticks(range(len(labels)), labels, rotation=45, fontsize=35)
+    plt.ylabel("Normalized Risk Score", fontsize=35)
+    plt.xlabel("Countries", fontsize=35)
+    plt.grid(alpha=.4)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300, bbox_inches='tight')
+    plt.show()
+
+plot("BIS", bis_norm, bis_bub, 'blue',   "bubble_BIS_all_periods.png")
+plot("UN",  un_norm,  un_bub,  'orange', "bubble_UN_all_periods.png")
+
+print("✅ 그래프 저장 완료: bubble_BIS_all_periods.png / bubble_UN_all_periods.png")
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from pathlib import Path
+
+
+bis_path = Path("./output/multilayer_results_BIS.xlsx")
+un_path  = Path("./output/multilayer_results_UN.xlsx")
+ISO2_TO_3 = {"AU":"AUS","AT":"AUT","BE":"BEL","BR":"BRA","CA":"CAN","CH":"CHE","CL":"CHL",
+             "DE":"DEU","DK":"DNK","ES":"ESP","FI":"FIN","FR":"FRA","GB":"GBR","HK":"HKG",
+             "IE":"IRL","IT":"ITA","JP":"JPN","NL":"NLD","SE":"SWE","US":"USA"}
+
+order = ["GBR","USA","JPN","FRA","DEU","SWE","FIN","CHE","ITA","ESP",
+         "IRL","NLD","CAN","BEL","BRA","AUT","DNK","HKG","AUS","CHL"]
+
+
+man_bis = np.array([250.6981,241.2684,158.2254,136.7064,131.7540,96.7809,96.1975,
+                     85.4969,80.6707,77.6661,72.7587,69.0715,64.0819,52.3795,40.7269,
+                     37.7269,33.7189,22.7910,22.1630,21.2920])
+man_un  = np.array([9.2134,9.1952,7.8842,7.7336,7.1842,6.2963,5.3678,5.2920,
+                     4.4875,4.2451,3.6266,3.3629,3.3041,2.5927,2.4395,2.0595,
+                     1.3704,1.3555,1.2396,0.6009])
+
+cnt_bis = np.array([31,32,3,3,4,3,2,1,6,3,2,1,0,1,2,1,1,0,0,0])
+cnt_un  = np.array([0,32,0,1,29,0,0,0,10,3,7,0,0,0,13,0,0,0,0,1])
+
+
+def iso3(c): c=str(c).strip(); return ISO2_TO_3.get(c,c)
+def agg(path):
+    xl = pd.ExcelFile(path)
+    codes = [iso3(c) for c in xl.parse(xl.sheet_names[0]).columns[1:]]
+    pos = {c:i for i,c in enumerate(codes)}
+    idx = [pos[c] for c in order]
+    s = np.zeros(len(codes)); cnt = np.zeros(len(codes),int)
+    for sh in xl.sheet_names:
+        last = xl.parse(sh).iloc[-1,1:].astype(float).values
+        s += last;   cnt += (last>=1.0)
+    return s[idx], cnt[idx]
+
+exa_bis, cnt_exa_bis = agg(bis_path)
+exa_un , cnt_exa_un  = agg(un_path)
+
+
+def bubble(c, base=4000, min_size=80):
+    if c.max()==0: return np.full_like(c, min_size)
+    s = np.log1p(c.astype(float)); return np.maximum(base*s/s.max(), min_size)
+
+b_bis_ex = bubble(cnt_exa_bis); b_un_ex = bubble(cnt_exa_un)
+b_bis_m  = bubble(cnt_bis)    ; b_un_m = bubble(cnt_un)
+
+
+x = np.arange(len(order))
+
+
+def triple(layer_left, left_vals, left_bub, left_col,
+           man_bis_vals, man_bis_bub,
+           man_un_vals,  man_un_bub,
+           outfile):
+    fig, axL = plt.subplots(figsize=(20,12))
+    axL.scatter(x, left_vals, s=left_bub, c=left_col, alpha=.85, label=f"Excel {layer_left}")
+    axL.set_ylabel(f"Excel {layer_left} Risk (합계)", fontsize=26, color=left_col)
+    axL.tick_params(axis='y', labelcolor=left_col)
+    axL.grid(alpha=.25)
+
+    axR1 = axL.twinx()
+    axR1.scatter(x, man_bis_vals, s=man_bis_bub, c='red', alpha=.55, label="Manual BIS")
+    axR1.set_ylabel("Manual Risk", fontsize=26, color='black')
+    axR1.tick_params(axis='y', labelcolor='black')
+
+    axR2 = axL.twinx()
+    axR2.spines['right'].set_position(("outward", 60)) 
+    axR2.scatter(x, man_un_vals, s=man_un_bub, c='green', alpha=.55, label="Manual UN")
+    axR2.tick_params(axis='y', labelcolor='black')
+    axR2.set_ylabel("Manual UN", fontsize=26, color='green')
+
+    axL.set_xticks(x); axL.set_xticklabels(order, rotation=45, fontsize=24)
+    axL.set_xlabel("Countries", fontsize=28)
+
+    handles, labels = [], []
+    for ax in (axL, axR1, axR2):
+        h,l = ax.get_legend_handles_labels()
+        handles += h; labels += l
+    axL.legend(handles, labels, loc='upper right', fontsize=18, markerscale=.6)
+
+    plt.title(f"{layer_left} 기준 – Excel(왼쪽) vs Manual(BIS / UN)", fontsize=32, pad=18)
+    plt.tight_layout(); plt.savefig(outfile, dpi=300, bbox_inches='tight'); plt.show()
+
+triple("BIS", exa_bis, b_bis_ex, 'blue',
+       man_bis, b_bis_m,
+       man_un,  b_un_m,
+       "triple_BIS_left.png")
+
+triple("UN", exa_un, b_un_ex, 'orange',
+       man_bis, b_bis_m,
+       man_un,  b_un_m,
+       "triple_UN_left.png")
+
+print("✅ 저장 완료 → triple_BIS_left.png / triple_UN_left.png")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+bis_path = Path("./output/multilayer_results_BIS.xlsx")
+un_path  = Path("./output/multilayer_results_UN.xlsx")
+ISO2_TO_3 = {"AU":"AUS","AT":"AUT","BE":"BEL","BR":"BRA","CA":"CAN","CH":"CHE","CL":"CHL",
+             "DE":"DEU","DK":"DNK","ES":"ESP","FI":"FIN","FR":"FRA","GB":"GBR","HK":"HKG",
+             "IE":"IRL","IT":"ITA","JP":"JPN","NL":"NLD","SE":"SWE","US":"USA"}
+
+order = ["GBR","USA","JPN","FRA","DEU","SWE","FIN","CHE","ITA","ESP",
+         "IRL","NLD","CAN","BEL","BRA","AUT","DNK","HKG","AUS","CHL"]
+
+man_bis = np.array([250.6981,241.2684,158.2254,136.7064,131.7540,96.7809,96.1975,
+                    85.4969,80.6707,77.6661,72.7587,69.0715,64.0819,52.3795,40.7269,
+                    37.7269,33.7189,22.7910,22.1630,21.2920])
+man_un  = np.array([9.2134,9.1952,7.8842,7.7336,7.1842,6.2963,5.3678,5.2920,
+                    4.4875,4.2451,3.6266,3.3629,3.3041,2.5927,2.4395,2.0595,
+                    1.3704,1.3555,1.2396,0.6009])
+
+cnt_bis = np.array([31,32,3,3,4,3,2,1,6,3,2,1,0,1,2,1,1,0,0,0])
+cnt_un  = np.array([0,32,0,1,29,0,0,0,10,3,7,0,0,0,13,0,0,0,0,1])
+
+def iso3(c): c=str(c).strip(); return ISO2_TO_3.get(c,c)
+
+def agg_last(path):
+    xl = pd.ExcelFile(path)
+    codes = [iso3(c) for c in xl.parse(xl.sheet_names[0]).columns[1:]]
+    pos   = {c:i for i,c in enumerate(codes)}
+    idx   = [pos[c] for c in order]   
+    s = np.zeros(len(codes)); cnt = np.zeros(len(codes),int)
+    for sh in xl.sheet_names:
+        last = xl.parse(sh).iloc[-1,1:].astype(float).values
+        s += last; cnt += (last>=1.0)
+    return s[idx], cnt[idx]
+
+exa_bis, cnt_exa_bis = agg_last(bis_path)
+exa_un , cnt_exa_un  = agg_last(un_path)
+
+def bubble(counts, base=4000, min_size=80, emph=(29,32)):
+    if counts.max()==0: return np.full_like(counts,min_size)
+    scaled = np.log1p(counts.astype(float))
+    scaled[(counts>=emph[0])&(counts<=emph[1])]*=1.8
+    return np.maximum(base*scaled/scaled.max(), min_size)
+
+bub_manual_bis = bubble(cnt_bis)
+bub_manual_un  = bubble(cnt_un)
+bub_excel_bis  = bubble(cnt_exa_bis)
+bub_excel_un   = bubble(cnt_exa_un)
+
+def norm(arr): arr=np.asarray(arr,float); return (arr-arr.min())/(arr.max()-arr.min()+1e-12)
+
+def plot_single(title, arr_blue, bub_blue, arr_yellow, bub_yellow,
+                arr_green, bub_green, outfile):
+    plt.figure(figsize=(20,12))
+    x = np.arange(len(order))
+
+    plt.scatter(x, norm(arr_blue),   s=bub_blue,   c='blue',   alpha=.8, label="BIS")
+    plt.scatter(x, norm(arr_yellow), s=bub_yellow, c='orange', alpha=.8, label="UN")
+    plt.scatter(x, norm(arr_green),  s=bub_green,  c='green',  alpha=.8, label="New Multilayer Data")
+
+    plt.xticks(x, order, rotation=45, fontsize=26)
+    plt.ylabel("Normalized Risk Score", fontsize=30)
+    plt.xlabel("Countries", fontsize=30)
+    plt.title(title, fontsize=34, pad=18)
+    plt.grid(alpha=.25)
+    plt.legend(fontsize=20, markerscale=.6, loc='upper right')
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300, bbox_inches='tight')
+    plt.show()
+
+plot_single("BIS vs UN vs Multilayer(BIS)",
+            man_bis, bub_manual_bis,
+            man_un,  bub_manual_un,
+            exa_bis, bub_excel_bis,
+            "overlay_manual_vs_excel_BIS.png")
+
+plot_single("BIS vs UN vs Multilayer(UN)",
+            man_bis, bub_manual_bis,
+            man_un,  bub_manual_un,
+            exa_un,  bub_excel_un,
+            "overlay_manual_vs_excel_UN.png")
+
+print("✅ 저장 완료 → overlay_manual_vs_excel_BIS.png / overlay_manual_vs_excel_UN.png")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+BIS_PATH = Path("./output/BIS_multiplex_results.xlsx")
+UN_PATH  = Path("./output/UN_multiplex_results.xlsx")
+
+ISO2_TO_3 = {
+    "AU":"AUS","AT":"AUT","BE":"BEL","BR":"BRA","CA":"CAN","CH":"CHE","CL":"CHL",
+    "DE":"DEU","DK":"DNK","ES":"ESP","FI":"FIN","FR":"FRA","GB":"GBR","HK":"HKG",
+    "IE":"IRL","IT":"ITA","JP":"JPN","NL":"NLD","SE":"SWE","US":"USA"
+}
+DISPLAY_ORDER = [
+    "GBR","USA","JPN","FRA","DEU","SWE","FIN","CHE","ITA","ESP",
+    "IRL","NLD","CAN","BEL","BRA","AUT","DNK","HKG","AUS","CHL"
+]
+
+def iso3(code: str) -> str:
+    code = str(code).strip()
+    return ISO2_TO_3.get(code, code)   
+
+def load_last_rows(xlsx: Path) -> pd.DataFrame:
+
+    xl = pd.ExcelFile(xlsx)
+    first = xl.parse(xl.sheet_names[0])
+    codes = [iso3(c) for c in first.columns[1:]]
+    records = []
+    for sh in xl.sheet_names:
+        df = xl.parse(sh)
+        last = df.iloc[-1, 1:].astype(float).values
+        records.append(last)
+    out = pd.DataFrame(records, index=xl.sheet_names, columns=codes)
+    return out
+
+def bubble_sizes(counts, base=4000, min_size=80):
+
+    if counts.max() == 0:
+        return np.full_like(counts, min_size)
+    scale = np.log1p(counts.astype(float))
+    return np.maximum(base * scale / scale.max(), min_size)
+
+bis_df = load_last_rows(BIS_PATH)
+un_df  = load_last_rows(UN_PATH)
+
+countries = [c for c in DISPLAY_ORDER if c in bis_df.columns]
+bis_df = bis_df[countries]
+un_df  = un_df[countries]
+
+
+def plot_heatmap(df: pd.DataFrame, title: str, cmap: str, out_png: str):
+    plt.figure(figsize=(len(df.columns)*0.5+6, 10))
+    plt.imshow(df.values, aspect="auto", cmap=cmap, vmin=0, vmax=1)
+    plt.colorbar(label="Cumulative Risk")
+    yticks = range(0, len(df.index), 5) 
+    ylabels = [df.index[i] for i in yticks]
+    plt.yticks(yticks, ylabels)
+    plt.xticks(range(len(df.columns)), df.columns, rotation=45, ha="right")
+    plt.title(title, fontsize=20, pad=12)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.show()
+
+
+plot_heatmap(bis_df, "BIS – Final Step per Quarter", "Reds",  "heat_BIS.png")
+plot_heatmap(un_df,  "UN – Final Step per Quarter", "Oranges","heat_UN.png")
+
+
+def plot_bubble(sum_df: pd.DataFrame, title: str, color: str, out_png: str):
+    sums  = sum_df.sum(axis=0).values         
+    cnts  = (sum_df >= 1.0).sum(axis=0).values 
+    sizes = bubble_sizes(cnts)
+    plt.figure(figsize=(20, 10))
+    plt.scatter(countries, sums, s=sizes, c=color, alpha=0.75, edgecolors="k")
+    plt.xticks(rotation=45, ha="right", fontsize=14)
+    plt.ylabel("Total Risk (Σ over periods)", fontsize=16)
+    plt.title(title, fontsize=20, pad=10)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+    plt.show()
+
+plot_bubble(bis_df, "BIS – Total Risk & Hit Count", "blue",   "bubble_BIS.png")
+plot_bubble(un_df,  "UN – Total Risk & Hit Count",  "orange", "bubble_UN.png")
+print("✅ 4개의 그림 저장 완료 (heat_BIS.png / heat_UN.png / bubble_BIS.png / bubble_UN.png)")
