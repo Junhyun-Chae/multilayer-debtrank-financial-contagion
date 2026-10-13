@@ -15,11 +15,22 @@ and applies a **DebtRank-based contagion simulation** to analyze cross-country s
 
 ## Related Paper
 
-Chae, J., Inoue, H.
+Chae, J., & Inoue, H. (2026). Multilayer Propagation of Cross-Country Systemic Risk. *Journal of Risk and Financial Management*, 19(3), 197. https://doi.org/10.3390/jrfm19030197
 
-*A Quantitative Analysis of Financial Distress Propagation in International Networks Utilizing DebtRank and a Multi-layer Approach.*
+An earlier version, *A Quantitative Analysis of Financial Distress Propagation in International Networks Utilizing DebtRank and a Multi-layer Approach*, was presented at AROB-ISBC 2025 (Beppu, January 2025) and received the Young Author Award.
 
-Journal of Risk and Financial Management (MDPI)
+```bibtex
+@article{chae2026multilayer,
+  title   = {Multilayer Propagation of Cross-Country Systemic Risk},
+  author  = {Chae, Junhyun and Inoue, Hiroyasu},
+  journal = {Journal of Risk and Financial Management},
+  volume  = {19},
+  number  = {3},
+  pages   = {197},
+  year    = {2026},
+  doi     = {10.3390/jrfm19030197}
+}
+```
 
 ## Author
 
